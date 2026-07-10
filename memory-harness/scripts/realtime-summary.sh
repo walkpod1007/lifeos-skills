@@ -71,6 +71,14 @@ HHMM=$(date +"%H%M")
 HHMM_DISPLAY=$(date +"%H:%M")
 DATE_DIR="$DAILY_DIR/$DATE"
 
+# ── 摘要用的 claude --print 自己也會留下 transcript ──
+# 它落在 $CLAUDE_HOME/projects/<cwd 轉成的目錄名>/。若不隔離，下一輪就會去摘要
+# 上一輪摘要留下的 transcript，變成自我餵食的無限迴圈（且每輪都新增檔案）。
+# 對策：呼叫 claude 前固定 cd 到 SUMMARIZER_CWD，讓 transcript 一律落在同一個
+# 可預測的目錄，並把該目錄從監看清單排除。
+SUMMARIZER_CWD="/"
+SELF_PROJ_DIR="$CLAUDE_HOME/projects/-"
+
 # ── 監看清單解析 ──
 # auto = ~/.claude/projects/ 下近 24h 有 jsonl 活動的所有專案
 # （看 jsonl mtime 而非目錄 mtime：append 不會更新目錄時間戳）
@@ -85,6 +93,11 @@ resolve_watch_dirs() {
             [[ -d "$CLAUDE_HOME/projects/$name" ]] && printf '%s\n' "$CLAUDE_HOME/projects/$name"
         done
     fi
+}
+
+# 永遠排除摘要器自己的 transcript 目錄（顯式 LIFEOS_WATCH 指到它也一樣排除）
+filter_self_project() {
+    grep -vFx "$SELF_PROJ_DIR" || true
 }
 
 # 專案目錄名 → 短標籤（取最後一段；-Users-you-myproj → myproj）
@@ -201,14 +214,25 @@ STATE:
 對話記錄：
 ${NEW_TEXT}"
 
+    # 成功判準是「輸出符合契約」（白名單），不是「輸出不像錯誤訊息」（黑名單）。
+    # claude --print 認證失敗時 exit code 仍是 0、錯誤訊息走 stdout，而訊息文字隨環境而異
+    # （空環境是 "Not logged in"，launchd 與 Claude Code session 下都是 "API Error: 401"）。
+    # 黑名單漏掉任何一種寫法，錯誤訊息就會被當成摘要寫檔。
     local RESPONSE="" i UPDATE_OK=0
     for i in 1 2 3; do
-        RESPONSE=$(echo "$PROMPT" | "$TIMEOUT_BIN" -k 15 60 claude --print --model "$MODEL" 2>/dev/null || true)
-        [[ -n "$RESPONSE" ]] && ! echo "$RESPONSE" | grep -qi "not logged in\|please run.*login\|authentication failed\|unauthorized" && UPDATE_OK=1 && break
+        # cd 到 SUMMARIZER_CWD：這次呼叫留下的 transcript 才會落進被排除的 $SELF_PROJ_DIR，
+        # 而不是污染腳本當前所在的專案目錄（手動執行時 cwd 就是某個真專案）。
+        RESPONSE=$(cd "$SUMMARIZER_CWD" && echo "$PROMPT" | "$TIMEOUT_BIN" -k 15 60 claude --print --model "$MODEL" 2>/dev/null || true)
+        if [[ -n "$RESPONSE" ]] && echo "$RESPONSE" | grep -qE '^[#*[:space:]]*SUMMARY[:：]'; then
+            UPDATE_OK=1
+            break
+        fi
         sleep $((i*2))
     done
-    if [[ "$UPDATE_OK" != "1" || -z "$RESPONSE" ]]; then
-        echo "[error][$PROJ] 摘要模型三次 retry 仍失敗（檢查 claude 登入狀態）" >&2
+    if [[ "$UPDATE_OK" != "1" ]]; then
+        # 不寫 checkpoint：這段 transcript 必須留給下一輪重試，否則永遠不會被摘要。
+        echo "[error][$PROJ] 摘要三次 retry 仍無合法 SUMMARY，checkpoint 不推進（檢查 claude 登入狀態）" >&2
+        echo "[error][$PROJ] 模型最後輸出：${RESPONSE:0:200}" >&2
         return
     fi
 
@@ -220,7 +244,13 @@ ${NEW_TEXT}"
     PART2=$(echo "$RESPONSE" | grep -m1 -E '^[#*[:space:]]*SLUG[:：]' | sed -E 's/^[#*[:space:]]*SLUG[:：][[:space:]]*//; s/[*[:space:]]+$//' || true)
     PART3=$(echo "$RESPONSE" | awk '/^[#*[:space:]]*STATE[:：]/{f=1; next} f{print}' || true)
 
-    local SUMMARY="${PART1:-$RESPONSE}"
+    # 不可 fallback 成 $RESPONSE：那會在解析失敗時把模型的原始輸出（可能是錯誤訊息）當成摘要。
+    # 上面的契約驗證已保證 SUMMARY: 存在，這裡只防 sed 把它清成空字串。
+    local SUMMARY="$PART1"
+    if [[ -z "$SUMMARY" ]]; then
+        echo "[error][$PROJ] SUMMARY 標籤存在但內容為空，不寫檔（checkpoint 不推進）" >&2
+        return
+    fi
     local SLUG
     SLUG=$(echo "$PART2" | python3 -c "
 import sys, re
@@ -312,7 +342,7 @@ while IFS= read -r dir; do
     FOUND=1
     process_project "$dir"
     sleep 1
-done < <(resolve_watch_dirs)
+done < <(resolve_watch_dirs | filter_self_project)
 if [[ "$FOUND" == "0" ]]; then
     echo "[warn] 沒有可監看的專案（$CLAUDE_HOME/projects/ 近 24h 無活動，或 LIFEOS_WATCH 指的目錄不存在）" >&2
 fi
